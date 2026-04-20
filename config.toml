@@ -1,0 +1,41 @@
+[system]
+
+[system.logger]
+level = "DEBUG"
+buffersize = 5
+ # int (bytes) or str with suffix ("1b" , "1kb" , "1mb")
+max_file_size = "64kb"
+log_to_console = true
+log_to_file = true
+max_rotations = 3
+
+[system.health]
+onboard_status_led = false
+check_interval = 5000
+
+[system.runtime]
+interval = 0.1 # in s
+
+[power]
+
+[power.monitoring]
+enabled = false
+
+[power.battery]
+battery_voltage_max = 5.5  # Volts
+battery_voltage_nominal = 5  # Volts
+battery_voltage_cut_off = 3.3  # Volts
+battery_ah = 2.4  # Ampere-hours
+adc_pin = 28 # ADC Pin to measure battery voltage
+min_runtime = 10 # in min
+
+[power.voltage_divider]
+enabled = true
+r1 = 10_000 # Resistance of R1 in Ohms
+r2 = 5_100 # Resistance of R2 in Ohms
+
+
+[comms]
+
+[comms.mesh]
+enabled = false
