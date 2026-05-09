@@ -4,12 +4,14 @@ PicoCore V2 Util Module
 This module provides utility functions for file operations, system information,
 and other common tasks.
 """
+
 import time
 import os
 import sys
 import machine
 import uasyncio as asyncio
-from .constants import BOOT_FLAG, BOOT_WINDOW_MS
+from core.constants import BOOT_FLAG, BOOT_WINDOW_MS
+
 
 def _file_exists(name):
     try:
@@ -17,17 +19,32 @@ def _file_exists(name):
     except FileNotFoundError:
         # if filesystem not mounted or error -> conservatively assume no file
         try:
-            return name in os.listdir("/")   # fallback
+            return name in os.listdir("/")  # fallback
         except FileNotFoundError:
             return False
 
-def _create_boot_flag(encoding:str = "utf-8"):
+
+def get_file_size(file_name: str) -> int | None:
+    """
+    Get the size of a file
+
+    :param file_name:
+    :returns: int or None if not found or inaccessible
+    """
     try:
-        with open(BOOT_FLAG, "w",encoding=encoding) as f:
+        return os.stat(file_name)[6]
+    except OSError:
+        return None
+
+
+def _create_boot_flag(encoding: str = "utf-8"):
+    try:
+        with open(BOOT_FLAG, "w", encoding=encoding) as f:
             f.write("1")
     except OSError:
         # silently ignore write errors (rare)
         pass
+
 
 def _remove_boot_flag():
     try:
@@ -37,12 +54,14 @@ def _remove_boot_flag():
         # ignore errors; not critical
         pass
 
+
 async def _delayed_clear_boot_flag():
     # Run as uasyncio task; sleeps, then removes flag.
     await asyncio.sleep_ms(BOOT_WINDOW_MS)
     _remove_boot_flag()
 
-#TODO: replace this with other more efficient logic. May use a hardware pin to  set it
+
+# TODO: replace this with other more efficient logic. May use a hardware pin to  set it
 async def boot_flag_task():
     """
     This function checks if the boot flag file exists and if it does,
@@ -53,15 +72,16 @@ async def boot_flag_task():
         await _delayed_clear_boot_flag()
 
 
-def create_file(path:str, encoding:str = "utf-8"):
+def create_file(path: str, encoding: str = "utf-8"):
     """
     This function creates a file at the specified path.
     :param encoding: The encoding to use when writing the file.
     :param path: The path to the file to create.
     :return:
     """
-    with open(path, "w",encoding=encoding) as f:
+    with open(path, "w", encoding=encoding) as f:
         f.write("")
+
 
 def uptime(ms: bool = False, formatted: bool = False) -> int | str:
     """
@@ -138,7 +158,8 @@ def uuid(byte: bool = False) -> bytes | str:
 
     return machine.unique_id().hex()
 
-def version() -> list[str]|None:
+
+def version() -> list[str] | None:
     """
     Get the current version of PicoCore.
 
@@ -149,61 +170,111 @@ def version() -> list[str]|None:
     _v_path = "/core/.version"
     try:
         if os.stat(_v_path)[6] >= 13:
-            with open(_v_path,encoding="utf-8") as version_file:
+            with open(_v_path, encoding="utf-8") as version_file:
                 return version_file.read().strip().replace("\r", "").split("\n")
         else:
-            raise ValueError("Version file could not be read."
-                             "Please check if the file exists and is not empty.")
+            raise ValueError(
+                "Version file could not be read."
+                "Please check if the file exists and is not empty."
+            )
     except OSError as e:
-        raise ValueError("Version file could not be read."
-                         "Please check if the file exists and is not empty.") from e
+        raise ValueError(
+            "Version file could not be read."
+            "Please check if the file exists and is not empty."
+        ) from e
 
 
+_ONBOARD_LED_CACHE = None
 
-def get_onboard_led() -> int | str:
+
+def get_onboard_led() -> tuple[str, int] | tuple[int]:
     """
-    Get the onboard LED pin. (Platform dependent)
-    :return: The onboard LED pin.
+    Get the built-in onboard Led.
+    This function tries to detect and then returns the then cached value.
+
+
+    :return: result is either tuple("neopixel",pin_number) or if regular led tuple(pin_number) -> detected using board information
     """
+    global _ONBOARD_LED_CACHE
+    if _ONBOARD_LED_CACHE is not None:
+        return _ONBOARD_LED_CACHE
+
     platform = sys.platform
 
-    if platform.startswith("rp2"):              # Pi Pico
-        try:
-            return "LED"
-        except Exception as e:
-            raise RuntimeError("Pico LED not available") from e
+    impl = getattr(sys, "implementation", None)
+    build = getattr(impl, "_build", "")
+    machine_tag = getattr(impl, "_machine", "")
 
-    if platform.startswith("esp32"):            # ESP32, ESP32-C3, S2, S3
-        candidate_pins = (2, 8, 19, 38)         # common boards
+    if platform == "rp2":
+        result = "LED"
 
-        for pin in candidate_pins:
-            try:
-                p = machine.Pin(pin, machine.Pin.OUT)
-                p.value(1)                      # test LED ON
-                p.value(0)                      # OFF
-                return pin
-            except (ValueError, OSError) :
-                pass
+    elif platform == "esp32":
+        if "S3" in build or "S3" in machine_tag:
+            result = ("neopixel", 38)
+        elif "C3" in build or "C3" in machine_tag:
+            result = ("neopixel", 8)
+        else:
+            # minimal probing
+            Pin = machine.Pin
+            for pin in (2, 8):
+                try:
+                    p = Pin(pin, Pin.OUT)
+                    p.value(1)
+                    p.value(0)
+                    result = pin
+                    break
+                except Exception:
+                    pass
+            else:
+                raise RuntimeError("No LED found")
 
-    raise RuntimeError("Unsupported platform: " + platform)
+    else:
+        raise RuntimeError("Unsupported platform")
 
-ONBOARD_LED: str | int | None = get_onboard_led()
+    _ONBOARD_LED_CACHE = result
+    return result
 
-def timed_function(f, *args, **kwargs):
+
+def timed_function(f, *_args, **_kwargs):
     """
     A decorator function to test the execution time of any function decorated with @timed_function.
 
     :param f:
-    :param args:
-    :param kwargs:
+    :param _args:
+    :param _kwargs:
 
     :returns:
     """
     myname = f.__name__
-    def new_func(*args, **kwargs):
+
+    def new_func(*_args, **_kwargs):
         t = time.ticks_us()
-        result = f(*args, **kwargs)
+        result = f(*_args, **_kwargs)
         delta = time.ticks_diff(time.ticks_us(), t)
-        print('Function {} Time = {:6.3f}ms'.format(myname, delta/1000))
+        print(f"Function {myname} Time = {delta / 1000:6.3f}ms")
         return result
+
     return new_func
+
+
+def deprecated(reason=""):
+    """
+    Mark a function as DEPRECATED and log a warning if used.
+
+    Args:
+        reason: The reason or what to do now.
+
+    Returns:
+
+    """
+
+    def deco(fn):
+        def wrapper(*args, **kwargs):
+            from core.logging import logger
+
+            logger().warn(f"{fn.__name__} is deprecated. {reason}")
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    return deco

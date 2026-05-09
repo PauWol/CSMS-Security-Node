@@ -2,7 +2,7 @@ from micropython import const
 
 from core.io import ADC
 
-from constants import (
+from lib.constants import (
     V_PHOTO_CELL_NIGHT,
     V_PHOTO_CELL_DAYLIGHT,
     V_PHOTO_CELL_TWILIGHT,
@@ -40,9 +40,9 @@ class Photo:
 
         :return: Normalized sensor value (0.0–1.0)
         """
-        return self._normalize(await self._pin.async_mean(_type="raw"))
+        return 1 - self._normalize(await self._pin.async_mean(_type="raw"))
 
-    async def update(self) -> None:
+    async def update(self) -> float:
         """
         Update the cached sensor value.
         Must be called once before using the is_... functions.
@@ -50,6 +50,8 @@ class Photo:
         :return: None
         """
         self._last_val = await self._get_raw()
+        print("PHC", self._last_val)
+        return self._last_val
 
     def _mapping(self) -> int:
         """
@@ -91,3 +93,20 @@ class Photo:
 
     def is_twilight(self) -> bool:
         return self._mapping() == 1
+
+    async def is_connected(self):
+        return await self._pin.async_is_pin_connected()
+
+
+_ph_cell = None
+
+
+def get_photocell():
+    global _ph_cell
+
+    if _ph_cell:
+        return _ph_cell
+
+    _ph_cell = Photo()
+
+    return _ph_cell

@@ -132,35 +132,43 @@ class LD2410C:
     on_threat    : optional callback(dict signature) when a signature is ready
     """
 
-    # ── Construction ───────────────────────────────────────────────────────────
     def __init__(
         self,
-        uart_id: int = 1,
-        tx_pin: int = 4,
-        rx_pin: int = 5,
-        presence_pin: int | None = None,
-        engineering: bool = False,
+        uart_id=1,
+        tx_pin=4,
+        rx_pin=5,
+        presence_pin=None,
+        engineering=False,
         on_target=None,
         on_threat=None,
     ):
+        """
+
+        :param uart_id:
+        :type uart_id: int
+        :param tx_pin:
+        :type tx_pin: int
+        :param rx_pin:
+        :type rx_pin: int
+        :param presence_pin:
+        :type presence_pin: int | None
+        :param engineering:
+        :type engineering: bool
+        :param on_target:
+        :type on_target: function | None
+        :param on_threat:
+        :type on_threat: function | None
+        """
         # ── UART init (ESP32-safe, v1.27+) ────────────────────────────────────────
         # On v1.27 the UART() constructor with tx=/rx= kwargs installs the ESP-IDF
         # driver immediately. Calling .init() on an already-live driver → ESP_FAIL.
         # Fix: always deinit() first (guarded), then init() exactly once.
-        self._uart = UART(uart_id, tx=Pin(tx_pin), rx=Pin(rx_pin))
-
-        try:
-            self._uart.deinit()  # tears down stale driver, if any
-        except Exception:
-            pass  # fresh boot: driver not yet installed — fine
-
-        self._uart.init(
+        self._uart = UART(
+            uart_id,
             baudrate=256000,
-            bits=8,
-            parity=None,
-            stop=1,
-            timeout=100,
-            rxbuf=256,
+            tx=Pin(tx_pin),
+            rx=Pin(rx_pin),
+            rxbuf=256,  # IMPORTANT: reduce from 256
         )
 
         self._eng_mode = engineering
@@ -185,7 +193,6 @@ class LD2410C:
 
         self._initialised = False
 
-    # ── Initialisation ─────────────────────────────────────────────────────────
     async def init_sensor(self):
         await sleep_ms(100)
         await self._enter_config()
@@ -196,8 +203,6 @@ class LD2410C:
         await self._exit_config()
         await sleep_ms(50)
         self._initialised = True
-
-    # ── Public API ─────────────────────────────────────────────────────────────
 
     def update(self) -> TargetFrame | None:
         """
@@ -226,13 +231,13 @@ class LD2410C:
         while self._uart.any():
             self._uart.read(256)
 
-    async def warm_up_read(
-        self, count: int = 8, interval_ms: int = 100
-    ) -> TargetFrame | None:
+    async def warm_up_read(self, count=8, interval_ms=100) -> TargetFrame | None:
         """
         Flush stale buffer, then read `count` fresh frames.
         Returns the last valid frame, or None.
         Intended for on-demand (non-continuous) use.
+        :type count: int
+        :type interval_ms: int
         """
         self.flush()
         last_valid = None
@@ -271,8 +276,6 @@ class LD2410C:
     def energy(self) -> int:
         """Dominant target signal energy 0-100."""
         return self._last_frame.dominant_energy if self._last_frame else 0
-
-    # ── Configuration helpers ──────────────────────────────────────────────────
 
     async def configure(
         self,
@@ -381,8 +384,6 @@ class LD2410C:
         self._active_event = False
         self._absence_ms = 0
 
-    # ── Internal: UART framing ─────────────────────────────────────────────────
-
     def _read_frame(self) -> TargetFrame | None:
         if not self._uart.any():
             return None
@@ -472,8 +473,6 @@ class LD2410C:
             self.stats["parse_errors"] += 1
             return None
 
-    # ── Internal: command framing ──────────────────────────────────────────────
-
     @staticmethod
     def _build_cmd_frame(cmd_word: int, value: bytes = b"") -> bytes:
         """
@@ -517,9 +516,6 @@ class LD2410C:
         await sleep_ms(50)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  EXAMPLE USAGE
-# ══════════════════════════════════════════════════════════════════════════════
 """
 from ld2410c import LD2410C, TARGET_MOVING
 from asyncio import sleep_ms

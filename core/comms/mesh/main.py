@@ -4,6 +4,9 @@ PicoCore V2 Comms Mesh Main
 This module provides the PicoCore V2 Comms Mesh main class.
 """
 
+import io
+import os
+import sys
 import time
 import gc
 from network import WLAN, STA_IF
@@ -15,14 +18,13 @@ from core.comms.constants import (
     MESH_TYPE_HELLO_ACK,
     BROADCAST_ADDR,
     DEFAULT_TTL,
-    MESH_FLAG_UNSECURE,
     MESH_FLAG_BCAST,
     MESH_FLAG_ACK,
     UNDEFINED_NODE_ID,
     BROADCAST_ADDR_MAC,
     MESH_FLAG_UNICAST,
     MESH_TYPE_DATA,
-    MAX_PMK_BYTE_LEN,
+    PMK_BYTE_LEN,
     PMK_DEFAULT_KEY,
     MESH_FLAG_GATEWAY,
     MESH_FLAG_PARTIAL,
@@ -30,23 +32,39 @@ from core.comms.constants import (
     MESH_FLAG_PARTIAL_START,
     MESH_CLEAN_INTERVAL,
     MESH_HELLO_INTERVAL,
+    ESPNOW_WIFI_CHANNEL,
+    ESPNOW_WIFI_TXPOWER,
+    MESH_FLAG_FILE,
+    FILE_RX_WINDOW_SIZE,
+    MESH_TYPE_ACK,
 )
-from core.constants import MESH_SECRET, MESH_GATEWAY
+from core.constants import MESH_SECRET, MESH_GATEWAY, EVENT_MESH_FILE_RECEIVED
 from core.queue import RingBuffer
+from core.root.bus import async_emit
 from core.logging import logger
 from core.config import get_config
-from .packets import (
+from core.util import _file_exists, deprecated
+from core.comms.mesh.packets import (
     build_packet,
     parse_packet,
     chunk_packet,
+    chunk_file,
     encode_neighbour_tuple,
     decode_neighbour_bytes,
-    payload_conv_iter,
 )
 
 
 class NodeNotFoundError(Exception):
     pass
+
+
+FH = 0
+BUF = 1
+BASE = 2
+TOTAL = 3
+LAST = 4
+NAME = 5
+SIZE = 6
 
 
 class Mesh:  # pylint: disable=too-many-instance-attributes
@@ -77,6 +95,17 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         self._rx_expected_until = 0  # ticks_ms timestamp
         self._raw_recv_callback_data = False
         self._fragments = {}  # (src, seq) -> [chunks]
+
+        # self._file_rx[key] = [
+        #     fh,
+        #     [None] * WINDOW_SIZE,
+        #     0,
+        #     total,
+        #     time.ticks_ms(),
+        #     name
+        # ]
+        self._file_rx = {}
+        self._ack_set = set()
         self._neighbor_timeout = 30000  # 30s
 
         self._seen_packets = set()
@@ -148,6 +177,15 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         return int(timeout * 1000)
 
+    # TODO add proper clean logic also fo partial messages and optimize.
+    def _clean_fragment_buffers(self, now):
+
+        for k, s in list(self._file_rx.items()):
+            if time.ticks_diff(now, s[LAST]) > 20000:
+                s[FH].close()
+                os.rename(s[NAME] + ".tmp", s[NAME] + ".corrupt")
+                del self._file_rx[k]
+
     # Sequencing section ---------------------------------------------------------------
 
     def _up_sequence(self) -> None:
@@ -168,7 +206,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         if len(self._seen_queue) > self._seen_limit:
             old = self._seen_queue.get()
-            self._seen_packets.remove(old)
+            self._seen_packets.discard(old)
 
         return False
 
@@ -412,7 +450,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         :return:
         """
-        return 0 < len(pmk) <= MAX_PMK_BYTE_LEN
+        return len(pmk) == PMK_BYTE_LEN
 
     def _update_pmk(self, pmk: bytes | bytearray | str) -> None:
         """
@@ -423,13 +461,16 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         _pmk_l = pmk
 
         if not self._is_pmk_valid(pmk):
+            logger().warn(
+                f"PMK: {pmk} is invlaid length needs to be {PMK_BYTE_LEN}.Using default pmk!"
+            )
             _pmk_l = PMK_DEFAULT_KEY
 
         self._esp.set_pmk(_pmk_l)
 
     # Routing section ----------------------------------------------------------------------
     #
-    # For no routing is:
+    # For now routing is:
     # Before development of this logic an already better algorithm is planned.
     #
     # Algorithm Idea:
@@ -522,10 +563,10 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         :param msg:
         :return:
         """
-        # TODO: Update this function for efficiency repeated node id calls etc -> pre-allocate etc.
+        # TODO: Update this function for efficiency as still in active feature dev -> later remove logger calls
         parsed = parse_packet(msg)
         if not parsed:
-            return
+            return  # Return on dropped packages when runtime assertions don't apply -> ex. protocol version
         _version, _ptype, _src, _dst, _seq, _ttl, _flags, _plen, _payload = parsed
 
         my_id = self.node_id()
@@ -537,8 +578,12 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
             return
 
         key = (_src, _seq)
-        # DROP duplicates if not partial
-        if not (_flags & MESH_FLAG_PARTIAL) and self._seen(*key):
+
+        # DROP duplicates if not partial or hello
+        is_stream = _flags & (MESH_FLAG_FILE | MESH_FLAG_PARTIAL)
+        is_hello = _ptype == MESH_TYPE_HELLO
+
+        if not is_stream and not is_hello and self._seen(*key):
             return
 
         if _flags & MESH_FLAG_GATEWAY:
@@ -551,6 +596,10 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
         if _ptype == MESH_TYPE_HELLO:
             logger().debug("HELLO packet received")
+
+            to_remove = [k for k in self._seen_packets if k[0] == _src]
+            for k in to_remove:
+                self._seen_packets.discard(k)
 
             if _flags & MESH_FLAG_ACK:
                 await self.async_hello_ack(host)
@@ -568,6 +617,11 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                 )
             return
 
+        if _ptype == MESH_TYPE_ACK and _dst == my_id:
+            _old_seq = _payload[0] | (_payload[1] << 8)
+            self._ack_set.add((_old_seq, _src))
+            return
+
         # FORWARD if not for us and not Broadcast
         if (
             _dst != my_id
@@ -583,28 +637,134 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                 )
 
                 # broadcast forward (simple flooding)
-                self._esp.send(self.target(_dst), fwd_packet, False)
+                await self._async_send(fwd_packet, self.target(_dst), False)
 
             return
 
         if _ptype == MESH_TYPE_DATA:
             logger().debug("DATA packet received")
 
-            if _flags & MESH_FLAG_PARTIAL:
+            if _flags & MESH_FLAG_FILE:
+                logger().debug("FILE packet received")
+
                 if _flags & MESH_FLAG_PARTIAL_START:
-                    self._fragments[key] = []
+                    logger().debug("FILE start")
+                    size = (
+                        (_payload[0] << 24)
+                        | (_payload[1] << 16)
+                        | (_payload[2] << 8)
+                        | _payload[3]
+                    )
+
+                    total = (_payload[4] << 8) | _payload[5]
+                    name_len = _payload[6]
+                    name = _payload[7 : 7 + name_len].decode()
+
+                    fh = open(name + ".tmp", "wb")  # noqa: SIM115
+
+                    self._file_rx[key] = [
+                        fh,
+                        [None] * FILE_RX_WINDOW_SIZE,
+                        0,
+                        total,
+                        time.ticks_ms(),
+                        name,
+                        size,
+                    ]
+
+                    await self.async_send_ack(_src, _seq)
+                    return
+
+                if _flags & MESH_FLAG_PARTIAL:
+                    if key not in self._file_rx:
+                        return
+
+                    state = self._file_rx[key]
+
+                    idx = (_payload[0] << 8) | _payload[1]
+                    logger().debug(f"File partial: {idx}")
+                    data = _payload[2:]
+
+                    base = state[BASE]
+                    buf = state[BUF]
+                    win = len(buf)
+
+                    offset = idx - base
+
+                    # ignore old or out-of-window
+                    if offset < 0 or offset >= win:
+                        return
+
+                    if buf[offset] is None:
+                        buf[offset] = data
+
+                    fh = state[FH]
+
+                    while buf[0] is not None:
+                        fh.write(buf[0])
+
+                        # shift window
+                        buf.pop(0)
+                        buf.append(None)
+
+                        state[BASE] += 1
+
+                    if _flags & MESH_FLAG_PARTIAL_END:
+                        logger().debug("File end")
+                        if state[BASE] == state[TOTAL]:
+                            # success
+                            fh.close()
+                            n = state[NAME]
+                            os.rename(n + ".tmp", n)
+                        else:
+                            # incomplete
+                            fh.close()
+                            n = state[NAME]
+                            os.rename(n + ".tmp", n + ".corrupt")
+
+                        del self._file_rx[key]
+                        await async_emit(EVENT_MESH_FILE_RECEIVED, n)
+
+                    await self.async_send_ack(_src, _seq)
+                    return
+
+            elif _flags & MESH_FLAG_PARTIAL:
+                idx = _payload[0]
+                total = _payload[1]
+                data = _payload[2:]
+
+                if _flags & MESH_FLAG_PARTIAL_START:
+                    self._fragments[key] = [None] * total
 
                 if key not in self._fragments:
-                    return  # drop invalid sequence
-
-                self._fragments[key].append(_payload)
-
-                if _flags & MESH_FLAG_PARTIAL_END:
-                    full = b"".join(self._fragments[key])
-                    del self._fragments[key]
-                    _payload = full
-                else:
                     return
+
+                frags = self._fragments[key]
+                frags[idx] = data
+
+                if not (_flags & MESH_FLAG_PARTIAL_END):
+                    return
+
+                # check completeness
+                for f in frags:
+                    if f is None:
+                        return
+
+                # build final payload efficiently
+                total_len = sum(len(f) for f in frags)
+                full = bytearray(total_len)
+
+                pos = 0
+                for f in frags:
+                    l = len(f)
+                    full[pos : pos + l] = f
+                    pos += l
+
+                del self._fragments[key]
+                _payload = full
+
+            if _flags & MESH_FLAG_ACK:
+                await self.async_send_ack(_src, _seq)
 
             try:
                 # (mac,node_id),(_payload)
@@ -619,7 +779,25 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                     "(e.g. 'await asyncio.sleep(0)') to avoid blocking the scheduler."
                 )
                 logger().error(f"Original Mesh receive error: {e}")
+            except UnicodeError as e:
+                logger().error(
+                    "Mesh UnicodeError: payload could not be decoded as UTF-8.\n"
+                    "This usually means the sender transmitted raw binary data (e.g. struct-packed bytes).\n"
+                    "Fix options:\n"
+                    "  1. Register the callback with raw=True to receive bytes without decoding:\n"
+                    "       @mesh_callback(raw=True)\n"
+                    "  2. Base64-encode the payload before sending:\n"
+                    "       import ubinascii\n"
+                    "       encoded = ubinascii.b2a_base64(raw_bytes).strip()\n"
+                    "     and decode it in the callback:\n"
+                    "       ubinascii.a2b_base64(msg)"
+                )
+                logger().error(f"Original Mesh receive error: {e}")
+
             except Exception as e:
+                buf = io.StringIO()
+                sys.print_exception(e, buf)
+                logger().error(buf.getvalue())
                 logger().error(f"Mesh receive error in callback: {e}")
 
     def _hello(self) -> tuple[bytearray, bytes]:
@@ -638,7 +816,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
             BROADCAST_ADDR,
             self._sequence,
             self._ttl,
-            MESH_FLAG_BCAST | MESH_FLAG_ACK | MESH_FLAG_UNSECURE,
+            MESH_FLAG_BCAST | MESH_FLAG_ACK,
             b"",
             self._gateway,
         ), BROADCAST_ADDR_MAC
@@ -661,7 +839,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
     def _hello_ack(
         self, mac: bytes | bytearray
-    ) -> tuple[int, int, int, int, int, int, bytes]:
+    ) -> tuple[int, int, int, int, int, int, bytes, bool]:
         """
         Build the hello_ack packet.
 
@@ -670,7 +848,6 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         """
         _payload = encode_neighbour_tuple(self._neighbors)
         logger().debug(f"HELLO_ACK _payload: {_payload}")
-        _flags = MESH_FLAG_UNICAST | MESH_FLAG_UNSECURE
 
         self._up_sequence()
 
@@ -680,8 +857,9 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
             self.node_id(mac),
             self._sequence,
             self._ttl,
-            _flags,
+            0,
             _payload,
+            self._gateway,
         )
 
     def hello_ack(self, mac: bytes | bytearray) -> None:
@@ -707,6 +885,49 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         for _p in chunk_packet(*_pkt):
             logger().debug("Sending chunk...")
             await self._async_send(_p, mac, False)
+
+    def wait_for_ack(self, node_id: int, seq: int, timeout: float = 5.0) -> bool:
+        """
+        Wait for an acknowledgment (ACK) from a specific node for a given sequence number.
+
+        :param node_id: The ID of the node expected to send the acknowledgment.
+        :param seq: The sequence number of the transmitted message to wait for.
+        :param timeout: Maximum time to wait for the acknowledgment in seconds.
+
+        :return: True if the acknowledgment is received within the timeout period,
+                 False if the timeout is exceeded before receiving the ACK.
+        """
+        start = time.ticks_ms()
+        key = (seq, node_id)
+        while key not in self._ack_set:
+            if time.ticks_diff(time.ticks_ms(), start) > timeout * 1000:
+                return False
+            time.sleep(0.05)  # small delay to yield CPU
+
+        self._ack_set.remove(key)
+        return True
+
+    async def async_wait_for_ack(
+        self, node_id: int, seq: int, timeout: float = 5.0
+    ) -> bool:
+        """
+        Wait for an acknowledgment (ACK) from a specific node for a given sequence number.
+
+        :param node_id: The ID of the node expected to send the acknowledgment.
+        :param seq: The sequence number of the transmitted message to wait for.
+        :param timeout: Maximum time to wait for the acknowledgment in seconds.
+
+        :return: True if the acknowledgment is received within the timeout period,
+                 False if the timeout is exceeded before receiving the ACK.
+        """
+        start = time.ticks_ms()
+        key = (seq, node_id)
+        while key not in self._ack_set:
+            if time.ticks_diff(time.ticks_ms(), start) > timeout * 1000:
+                return False
+            await asyncio.sleep(0.05)  # small delay to yield CPU
+        self._ack_set.remove(key)
+        return True
 
     def wait_for_hello_ack(self, node_id: int, timeout: float = 5.0) -> bool:
         """
@@ -744,62 +965,216 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         self,
         dst_node_id: int,
         payload: str | bytearray | bytes,
+        ack: bool = False,
         not_found_error: bool = False,
-    ) -> None:
+    ) -> tuple[int, int]:
         """
         Send a data packet/packets.
+
         :param dst_node_id: The target which the message should be sent to.
-        :param payload:
-        :param not_found_error: Weather to throw an error if target is unavailable. If off at this case it is Broadcasted.
-        :return:
+        :param payload: The data to be transmitted. Can be str, bytes, or bytearray.
+        :param ack: Whether an acknowledgment (ACK) is requested from the destination node.
+                    If True, the receiver is expected to respond with an ACK for this transmission.
+                    The caller can verify receipt by passing the returned tuple to `wait_for_ack`.
+        :param not_found_error: Whether to raise an error if the target is unavailable.
+                                If False and the target is not found, the message is broadcast.
+
+        :return: A tuple (dst_node_id, sequence_number) where:
+                 - dst_node_id: The destination node ID the data was sent to.
+                 - sequence_number: The sequence number assigned to this transmission,
+                                    shared by all packets generated from the payload.
+                                    This value should be used with `wait_for_ack` if ACK was requested.
         """
 
+        _f = MESH_FLAG_UNICAST
+
+        if ack:
+            _f = _f | MESH_FLAG_ACK
+
         _mac = self.target(dst_node_id, not_found_error)
+        self._up_sequence()
 
-        for _p in payload_conv_iter(payload):
-            self._up_sequence()
-            _pb = build_packet(
-                MESH_TYPE_DATA,
-                self.node_id(),
-                dst_node_id,
-                self._sequence,
-                self._ttl,
-                MESH_FLAG_UNICAST | MESH_FLAG_UNSECURE,
-                _p,
-                self._gateway,
-            )
+        _seq = self._sequence
+        for _p in chunk_packet(
+            MESH_TYPE_DATA,
+            self.node_id(),
+            dst_node_id,
+            _seq,
+            self._ttl,
+            _f,
+            payload,
+            self._gateway,
+        ):
+            self._send(_p, _mac, True)
 
-            self._send(_pb, _mac, True)
+        return dst_node_id, _seq
 
     async def async_send_data(
         self,
         dst_node_id: int,
         payload: str | bytearray | bytes,
+        ack: bool = False,
+        not_found_error: bool = False,
+    ) -> tuple[int, int]:
+        """
+        Send a data packet/packets.
+
+        :param dst_node_id: The target which the message should be sent to.
+        :param payload: The data to be transmitted. Can be str, bytes, or bytearray.
+        :param ack: Whether an acknowledgment (ACK) is requested from the destination node.
+                    If True, the receiver is expected to respond with an ACK for this transmission.
+                    The caller can verify receipt by passing the returned tuple to `wait_for_ack`.
+        :param not_found_error: Whether to raise an error if the target is unavailable.
+                                If False and the target is not found, the message is broadcast.
+
+        :return: A tuple (dst_node_id, sequence_number) where:
+                 - dst_node_id: The destination node ID the data was sent to.
+                 - sequence_number: The sequence number assigned to this transmission,
+                                    shared by all packets generated from the payload.
+                                    This value should be used with `wait_for_ack` if ACK was requested.
+        """
+
+        _f = MESH_FLAG_UNICAST
+
+        if ack:
+            _f = _f | MESH_FLAG_ACK
+
+        _mac = self.target(dst_node_id, not_found_error)
+        self._up_sequence()
+
+        _seq = self._sequence
+        for _p in chunk_packet(
+            MESH_TYPE_DATA,
+            self.node_id(),
+            dst_node_id,
+            _seq,
+            self._ttl,
+            _f,
+            payload,
+            self._gateway,
+        ):
+            await self._async_send(_p, _mac, True)
+
+        return dst_node_id, _seq
+
+    async def async_send_file(
+        self,
+        dst_node_id: int,
+        file_name: str,
+        new_name=None,
         not_found_error: bool = False,
     ) -> None:
         """
-        Send a data packet/packets.
-        :param dst_node_id:
-        :param payload:
-        :param not_found_error: Weather to throw an error if target is unavailable. If off at this case it is Broadcasted.
-        :return:
+        Send a file asynchronously over the mesh in chunked packets.
+
+
+        :param dst_node_id: Target node ID.
+        :param file_name: Local file path to send.
+        :param new_name: Optional remote filename override.
+        :param not_found_error: If True, raise if node is unknown; otherwise broadcast fallback.
+
+        :returns:
+
+        Notes:
+            - File is split into protocol chunks via `chunk_file`.
+            - Each chunk is sent over ESP-NOW asynchronously.
+            - Requires mesh to be started.
         """
-        _mac = self.target(dst_node_id, not_found_error)
-
-        for _p in payload_conv_iter(payload):
-            self._up_sequence()
-            _pb = build_packet(
-                MESH_TYPE_DATA,
-                self.node_id(),
-                dst_node_id,
-                self._sequence,
-                self._ttl,
-                MESH_FLAG_UNICAST | MESH_FLAG_UNSECURE,
-                _p,
-                self._gateway,
+        if not _file_exists(file_name):
+            logger().error(
+                f"file: {file_name} does not exist, couldn't be send to: {dst_node_id}"
             )
+            return
 
-            await self._async_send(_pb, _mac, True)
+        _mac = self.target(dst_node_id, not_found_error)
+        self._up_sequence()
+        _seq = self._sequence
+
+        for _p, i in chunk_file(
+            MESH_TYPE_DATA,
+            self.node_id(),
+            dst_node_id,
+            _seq,
+            self._ttl,
+            MESH_FLAG_UNICAST,
+            file_name,
+            new_name,
+            self._gateway,
+        ):
+            await self._async_send(_p, _mac, False)
+            logger().debug(f"Sending chunk: {i}")
+            await self.async_wait_for_ack(dst_node_id, _seq)
+
+    def send_file(
+        self,
+        dst_node_id: int,
+        file_name: str,
+        new_name=None,
+        not_found_error: bool = False,
+    ) -> None:
+        """
+        Send a file synchronously over the mesh in chunked packets.
+
+
+        :param dst_node_id: Target node ID.
+        :param file_name: Local file path to send.
+        :param new_name: Optional remote filename override.
+        :param not_found_error: If True, raise if node is unknown; otherwise broadcast fallback.
+
+        :returns:
+
+        Notes:
+            - File is split into protocol chunks via `chunk_file`.
+            - Each chunk is sent over ESP-NOW asynchronously.
+            - Requires mesh to be started.
+        """
+        if not _file_exists(file_name):
+            logger().error(
+                f"file: {file_name} does not exist, couldn't be send to: {dst_node_id}"
+            )
+            return
+
+        _mac = self.target(dst_node_id, not_found_error)
+        self._up_sequence()
+        _seq = self._sequence
+
+        for _p in chunk_file(
+            MESH_TYPE_DATA,
+            self.node_id(),
+            dst_node_id,
+            _seq,
+            self._ttl,
+            MESH_FLAG_UNICAST,
+            file_name,
+            new_name,
+            self._gateway,
+        ):
+            self._send(_p, _mac, False)
+            self.wait_for_ack(dst_node_id, _seq)
+
+    async def async_send_ack(
+        self, dst_node_id: int, seq: int, not_found_error: bool = False
+    ):
+
+        _mac = self.target(dst_node_id, not_found_error)
+        self._up_sequence()
+
+        _payload = bytearray(2)
+        _payload[0] = seq & 0xFF  # low byte
+        _payload[1] = (seq >> 8) & 0xFF  # high byte
+
+        _p = build_packet(
+            MESH_TYPE_ACK,
+            self.node_id(),
+            dst_node_id,
+            self._sequence,
+            self._ttl,
+            0,
+            _payload,
+            self._gateway,
+        )
+
+        await self._async_send(_p, _mac, False)
 
     # Mesh Runtime section -----------------------------------------------------------
 
@@ -824,6 +1199,9 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
             if not self._wlan.active():
                 self._wlan.active(True)
                 self._wlan.disconnect()
+                self._wlan.config(
+                    channel=ESPNOW_WIFI_CHANNEL, txpower=ESPNOW_WIFI_TXPOWER
+                )
 
             if self._esp is None:
                 self._esp = AIOESPNow()
@@ -831,11 +1209,11 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
                 # self._esp.config(rxbuf=4)
 
             _conf = get_config()
-            _secret = str(_conf.get(MESH_SECRET))
+            _secret = _conf.get(MESH_SECRET)
 
-            if _secret:
+            if _secret is not None:
                 time.sleep_ms(200)
-                self._update_pmk(_secret)
+                self._update_pmk(str(_secret))
 
             self._add(BROADCAST_ADDR_MAC)
 
@@ -866,9 +1244,14 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
 
     def rx_enable(self, listen_ms: int | None = None):
         """
-        Enable receiving packets.
-        :param listen_ms:
-        :return:
+        Enable packet reception.
+
+        Automatically starts the mesh (calls 'mesh().start()') if it has not
+        been started yet.
+
+        :param listen_ms: Optional duration in milliseconds to keep reception
+                          enabled. If None, reception remains enabled indefinitely.
+        :return: None
         """
         if not self._started:
             self.start()
@@ -917,34 +1300,110 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         self._raw_recv_callback_data = raw
         self._on_recv = callback
 
-    async def receive_task(self):
+    async def receive_task(self) -> None:
         """
-        This is the reception task. (DEPRECATED)
-        :return:
+        This is the new version of the reception task it now only handles that.
+        Only receives if rx_enabled was called.
+
+        Returns:
+
         """
         if not self._started:
             self.start()
+
+        _airecv = self._esp.airecv
+        _sleep_ms = asyncio.sleep_ms
+
         while True:
-            if not self._rx_enabled:
-                # nothing expected → idle cheaply
-                await asyncio.sleep_ms(250)
-                continue
+            # Receive
+            if self._rx_enabled:
+                try:
+                    host, msg = await _airecv()
+                    if host and msg:
+                        await self._irq(host, msg)
+                except asyncio.TimeoutError:
+                    pass
+                except Exception as e:
+                    buf = io.StringIO()
+                    sys.print_exception(e, buf)
+                    logger().error(buf.getvalue())
+                    logger().error(f"mesh rx error: {e}")
 
-            try:
-                host, msg = await self._esp.airecv()
-                if host and msg:
-                    await self._irq(host, msg)
-            except Exception as e:
-                logger().error(f"mesh rx error: {e}")
-                await asyncio.sleep_ms(20)
+            await _sleep_ms(5)
 
+    async def lifecycle_task(self) -> None:
+        """
+        This mesh task needs to be run when receive_task is run.
+        It enables auto neighbor discovery and neighbor table cleanup.
+
+        Returns:
+
+        """
+        if not self._started:
+            self.start()
+
+        # pre-allocate to save lookup time
+        _ticks_diff = time.ticks_diff
+        _ticks_ms = time.ticks_ms
+        _sleep_ms = asyncio.sleep_ms
+        _async_hello = self.async_hello
+        _clean_neighbors = self._cleanup_neighbors
+        _clean_fragments = self._clean_fragment_buffers
+
+        now = _ticks_ms()
+
+        last_hello = now - (
+            self.node_id() % 2000
+        )  # not just time but with jitter -> not all at the same time -> collision
+        last_clean = now
+
+        while True:
+            now = _ticks_ms()
+
+            # Hello
+            if _ticks_diff(now, last_hello) > MESH_HELLO_INTERVAL:
+                await _async_hello()
+                last_hello = now
+
+            # Clean
+            if _ticks_diff(now, last_clean) > MESH_CLEAN_INTERVAL:
+                _clean_neighbors()
+                _clean_fragments(now)
+                last_clean = now
+
+            # yield
+            await _sleep_ms(5)
+
+    @deprecated(
+        "Function was split in two separate ones, to fix the mesh-rx blocking other background tasks.See lifecycle_task and receive_task."
+    )
     async def run(self):
         """
-        Unified mesh runtime loop:
+        Unified mesh loop:
         - receive packets
-        - send heartbeat (HELLO)
+        - send HELLO (heartbeat)
         - cleanup neighbors
+
+        Timing:
+        - HELLO: every MESH_HELLO_INTERVAL ms (with node_id jitter)
+        - CLEAN: every MESH_CLEAN_INTERVAL ms
+
+        RX:
+        - host: tuple -> (MAC, node_id)
+        - msg: bytes|bytearray
+        - handled via self._irq(host, msg)
+
+        Notes:
+        - non-blocking RX (airecv)
+        - uses ticks_ms (wrap-safe)
+        - errors logged, loop continues
+        - auto-start if not started
+
+        :return: None
         """
+
+        if not self._started:
+            self.start()
 
         # pre-allocate to save lookup time
         _ticks_diff = time.ticks_diff
@@ -953,6 +1412,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
         _airecv = self._esp.airecv
         _async_hello = self.async_hello
         _clean_neighbors = self._cleanup_neighbors
+        _clean_fragments = self._clean_fragment_buffers
 
         now = _ticks_ms()
 
@@ -983,6 +1443,7 @@ class Mesh:  # pylint: disable=too-many-instance-attributes
             # Clean
             if _ticks_diff(now, last_clean) > MESH_CLEAN_INTERVAL:
                 _clean_neighbors()
+                _clean_fragments(now)
                 last_clean = now
 
             # yield
@@ -1023,7 +1484,7 @@ def mesh() -> Mesh:
 def mesh_callback(raw: bool = False):
     """
     Decorator to set the mesh callback function.
-    Register a callback function to be called when a packet is received.
+    Register an async callback function to be called when a packet is received.
 
     Note: The callback function should have the signature: callback(host, msg) or callback(*args).
 

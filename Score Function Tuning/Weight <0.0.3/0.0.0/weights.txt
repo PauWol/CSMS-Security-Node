@@ -1,0 +1,4 @@
+# --- THRESHOLDS ---
+THRESH_DAY       = 6.5
+THRESH_DUSK      = 3.5
+THRESH_NIGHT     = 4.5

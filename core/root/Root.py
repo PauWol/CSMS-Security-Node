@@ -53,6 +53,7 @@ class Task:
         "boot",
         "onetime",
         "parallel",
+        "running",
     )
 
     def __repr__(self):
@@ -62,7 +63,7 @@ class Task:
         self,
         name: str,
         callback,
-        interval: str | int | None = None,
+        interval=None,
         async_task: bool = True,
         enabled: bool = True,
         priority: int = 3,
@@ -76,6 +77,7 @@ class Task:
         :param name: Unique name of the task
         :param callback: Function or coroutine to execute
         :param interval: Execution interval (int ms or str like "1ms", "1s", "5min", "1h"), ignored for boot tasks
+        :type interval: str | int | None
         :param async_task: Whether the callback is async (coroutine)
         :param enabled: Whether the task is active
         :param priority: Task priority (lower = higher priority)
@@ -94,17 +96,18 @@ class Task:
         self.interval = 0
         self.last_run = 0
         self.next_run = 0
-        # TODO: Maybe add self.running param for parallel tasks to prevent multi spawned tasks.
+        self.running = False
         if boot and interval:
             logger().warn(
-                f"Interval {interval} for boot task {name} is ignored: {self.__repr__()} ;Consider Removing!"
+                "Interval %s for boot task %s is ignored: %s ;Consider Removing!"  # noqa: UP031
+                % (interval, name, self.__repr__())
             )
             self.interval = 0
         if onetime and boot:
             logger().warn(
                 f"Argument 'onetime' is unnecessary for boot task {name}: {self.__repr__()} ;Consider Removing!"
             )
-            self.onetime = 0
+            self.onetime = False
             return
 
         if onetime:
@@ -134,15 +137,14 @@ class Task:
 
         interval = interval.lower().strip()
 
-        if isinstance(interval, str):
-            if interval.endswith("ms"):
-                return int(interval[:-2])
-            if interval.endswith("s"):
-                return int(interval[:-1]) * 1000
-            if interval.endswith("min"):
-                return int(interval[:-3]) * 1000 * 60
-            if interval.endswith("h"):
-                return int(interval[:-1]) * 1000 * 60 * 60
+        if interval.endswith("ms"):
+            return int(interval[:-2])
+        if interval.endswith("s"):
+            return int(interval[:-1]) * 1000
+        if interval.endswith("min"):
+            return int(interval[:-3]) * 1000 * 60
+        if interval.endswith("h"):
+            return int(interval[:-1]) * 1000 * 60 * 60
 
         raise ValueError(
             f"Invalid interval format {interval}, should be int (ms) or str with 'ms' , 's' or 'h' suffix"
@@ -155,12 +157,13 @@ class Task:
         :param now: Current tick time
         :return: True if task should run
         """
-        if not self.enabled:
+        _enabled = self.enabled
+        if not _enabled:
             return False
 
         # onetime tasks run once when next_run reached
         if self.onetime:
-            return ticks_diff(now, self.next_run) >= 0
+            return _enabled and not self.running and ticks_diff(now, self.next_run) >= 0
 
         if self.interval == 0:
             return False
@@ -176,6 +179,7 @@ class Task:
         :param now: Current tick time
         """
         if not self.enabled:
+            self.running = False
             return
 
         self.last_run = now
@@ -184,6 +188,8 @@ class Task:
 
         if self.boot or self.onetime:
             self.enabled = False
+
+        self.running = False
 
     async def run_async(self, now: int):
         """
@@ -194,6 +200,7 @@ class Task:
         :param now: Current tick time
         """
         if not self.enabled:
+            self.running = False
             return
 
         self.last_run = now
@@ -202,6 +209,8 @@ class Task:
 
         if self.boot or self.onetime:
             self.enabled = False
+
+        self.running = False
 
 
 class Root:
@@ -233,13 +242,6 @@ class Root:
         logger().debug("Root initialized")
         self._init_system_tasks()
 
-    def __repr__(self):
-        """
-        Return a string representation of the root scheduler.
-        :return: String representation of the root scheduler
-        """
-        return f"Root(props={self.__dict__})"
-
     def _init_system_tasks(self):
 
         # boot flag task
@@ -256,11 +258,23 @@ class Root:
 
         if self.mesh:
             self._mesh = mesh()
-            # mesh task: receive_task
+
             self.add(
                 Task(
-                    "mesh_run_task",
-                    callback=self._mesh.run,
+                    "mesh_receive_task",
+                    callback=self._mesh.receive_task,
+                    async_task=True,
+                    priority=0,
+                    enabled=True,
+                    parallel=True,
+                    boot=True,
+                )
+            )
+
+            self.add(
+                Task(
+                    "mesh_lifecycle_task",
+                    callback=self._mesh.lifecycle_task,
                     async_task=True,
                     priority=0,
                     enabled=True,
@@ -432,8 +446,10 @@ class Root:
                 optimize_()
 
             for _task in tasks:
-                if _task.should_run(now):
+                if _task.should_run(now) and not _task.running:
                     if _task.parallel:
+                        _task.running = True
+
                         if _task.async_task:
                             create_task_(_task.run_async(now))
                         else:
@@ -463,6 +479,9 @@ class Root:
         except KeyboardInterrupt:
             print("Application stopped manually.")
         # except Exception as e: TODO: enable this
+        # buf = io.StringIO()
+        # sys.print_exception(e, buf)
+        # logger().fatal(buf.getvalue())
         # logger().fatal( f"Unhandled exception in Root.run: {e}")
 
 
