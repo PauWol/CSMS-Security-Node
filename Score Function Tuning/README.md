@@ -43,7 +43,7 @@ if avg_confidence < NOISE_CUT_OUT_THRESHOLD:
 ## Test Results
 
 ### Dataset: 652026-night-cycle.csv
-**Real sensor data** collected during night cycle (June 5, 2026). Contains ~1,800 samples of PIR, Radar confidence, photocell readings, and computed scores. **Not yet used for further tuning** — reserved for validation of production builds.
+**Real sensor data** collected during night cycle (May 6, 2026). Contains ~1,800 samples of PIR, Radar confidence, photocell readings, and computed scores. **Not yet used for further tuning** — reserved for validation of production builds.
 
 ### v0.0.3 Performance Visualizations
 
