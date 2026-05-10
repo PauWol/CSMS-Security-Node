@@ -168,7 +168,6 @@ def run_simulation(n=10):
         print(f"Threshold:   {threshold}")
         print(f"ALERT:       {'YES' if triggered else 'no'}")
 
-        # 🔥 THIS IS WHAT YOU WERE MISSING
         results.append({
             "event_type": event_type,
             "light": light,
@@ -182,7 +181,6 @@ def run_simulation(n=10):
             "triggered": int(triggered)
         })
 
-    # 🔥 AND THIS
     return pd.DataFrame(results)
 
 # %% Visualization
